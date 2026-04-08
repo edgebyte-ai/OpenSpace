@@ -6,6 +6,9 @@ Exposes the following tools to MCP clients:
   fix_skill      — Manually fix a broken skill (FIX only; DERIVED/CAPTURED via execute_task)
   upload_skill   — Upload a local skill to cloud (pre-saved metadata, bot decides visibility)
 
+Orchestrator-only tools (hidden unless OPENSPACE_MCP_ROLE=orchestrator):
+  execute_with_agent_cli — Run task via external agent CLI (codex/copilot/custom command)
+
 Usage:
     python -m openspace.mcp_server                     # auto (TTY -> SSE, MCP host -> stdio)
     python -m openspace.mcp_server --transport sse     # SSE on port 8080
@@ -22,6 +25,8 @@ import inspect
 import json
 import logging
 import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -124,6 +129,201 @@ _standalone_store = None
 _registered_skill_dirs: set = set()
 
 _UPLOAD_META_FILENAME = ".upload_meta.json"
+_SUPPORTED_AGENT_CLIS = {"codex", "copilot"}
+_MCP_ROLE = os.environ.get("OPENSPACE_MCP_ROLE", "public").strip().lower() or "public"
+_ORCHESTRATOR_ROLE = _MCP_ROLE == "orchestrator"
+logger.info("OpenSpace MCP role: %s", _MCP_ROLE)
+
+
+def _resolve_agent_cli_command(agent_cli: str, cli_command: Optional[str] = None) -> List[str]:
+    """Resolve agent CLI command.
+
+    Priority:
+      1. Explicit ``cli_command`` parameter
+      2. OPENSPACE_AGENT_CLI_COMMAND env
+      3. OPENSPACE_<AGENT>_CLI_COMMAND env
+      4. Built-in default command by agent name
+    """
+    if cli_command and cli_command.strip():
+        return shlex.split(cli_command)
+
+    env_cmd = os.environ.get("OPENSPACE_AGENT_CLI_COMMAND", "").strip()
+    if env_cmd:
+        return shlex.split(env_cmd)
+
+    by_name_env = os.environ.get(f"OPENSPACE_{agent_cli.upper()}_CLI_COMMAND", "").strip()
+    if by_name_env:
+        return shlex.split(by_name_env)
+
+    if agent_cli == "codex":
+        return ["codex", "exec"]
+    if agent_cli == "copilot":
+        return ["copilot", "agent", "run"]
+
+    raise ValueError(
+        f"Unsupported agent_cli='{agent_cli}'. "
+        f"Supported: {sorted(_SUPPORTED_AGENT_CLIS)}. "
+        "Or pass explicit cli_command."
+    )
+
+
+async def _run_agent_cli(
+    *,
+    task: str,
+    workspace_dir: Optional[str] = None,
+    agent_cli: str = "codex",
+    cli_command: Optional[str] = None,
+    timeout_seconds: int = 600,
+    extra_args: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Run an external agent CLI as the primary executor."""
+    command = _resolve_agent_cli_command(agent_cli=agent_cli, cli_command=cli_command)
+    if extra_args:
+        command.extend(extra_args)
+
+    # Most agent CLIs accept a trailing instruction argument.
+    # Keep contract simple: OpenSpace passes task as the last arg.
+    command.append(task)
+
+    cwd = workspace_dir or os.environ.get("OPENSPACE_WORKSPACE") or str(Path.cwd())
+    env = os.environ.copy()
+    env["OPENSPACE_EXECUTION_MODE"] = "external_agent_cli"
+    env["OPENSPACE_PRIMARY_AGENT_CLI"] = agent_cli
+
+    logger.info("Running external agent CLI: %s (cwd=%s)", command, cwd)
+    started = asyncio.get_event_loop().time()
+
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": cwd,
+        "env": env,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if os.name == "nt":
+        # Isolate child in a new process group so timeout cleanup can
+        # terminate the entire tree, not only the direct child process.
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        # Same intent on POSIX.
+        popen_kwargs["start_new_session"] = True
+
+    proc = await asyncio.create_subprocess_exec(*command, **popen_kwargs)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        if os.name == "nt":
+            try:
+                # Graceful interrupt first for CLIs that can shutdown cleanly.
+                proc.send_signal(subprocess.CTRL_BREAK_EVENT)
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            if proc.returncode is None:
+                proc.kill()
+        else:
+            try:
+                import signal
+                os.killpg(proc.pid, signal.SIGTERM)
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            if proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+        await proc.wait()
+        return {
+            "status": "error",
+            "response": "",
+            "error": (
+                f"External agent CLI timed out after {timeout_seconds}s and was terminated"
+            ),
+            "execution_time": round(asyncio.get_event_loop().time() - started, 2),
+            "agent_cli": agent_cli,
+            "command": command,
+            "exit_code": None,
+            "stderr": "",
+            "stdout": "",
+            "tool_executions": [],
+            "iterations": 0,
+        }
+
+    execution_time = round(asyncio.get_event_loop().time() - started, 2)
+    out_text = stdout.decode("utf-8", errors="replace")
+    err_text = stderr.decode("utf-8", errors="replace")
+    status = "success" if proc.returncode == 0 else "error"
+    response = out_text.strip() or err_text.strip()
+
+    return {
+        "status": status,
+        "response": response,
+        "error": "" if status == "success" else (err_text.strip() or f"exit code {proc.returncode}"),
+        "execution_time": execution_time,
+        "agent_cli": agent_cli,
+        "command": command,
+        "exit_code": proc.returncode,
+        "stderr": err_text[-4000:],
+        "stdout": out_text[-12000:],
+        "tool_executions": [],
+        "iterations": 1,
+    }
+
+
+async def _build_cli_orchestration_task(
+    openspace: Any,
+    task: str,
+) -> Dict[str, Any]:
+    """Build full orchestration context for external CLI execution.
+
+    This mirrors OpenSpace's skill-selection stage so external CLI mode
+    can reuse the same skill engine outputs (selection + injected guidance).
+    """
+    selected_skill_ids: List[str] = []
+    skill_context = ""
+    skill_selection: List[Dict[str, Any]] = []
+
+    registry = getattr(openspace, "_skill_registry", None)
+    if registry:
+        try:
+            skill_llm = openspace._get_skill_selection_llm()
+            selected, _selection_record = await registry.select_skills_with_llm(
+                task,
+                llm_client=skill_llm,
+                max_skills=2,
+                skill_quality=None,
+            )
+            if selected:
+                selected_skill_ids = [s.skill_id for s in selected]
+                skill_context = registry.build_context_injection(selected)
+                for s in selected:
+                    skill_selection.append(
+                        {
+                            "skill_id": s.skill_id,
+                            "name": s.name,
+                            "description": s.description,
+                            "path": str(s.skill_path),
+                        }
+                    )
+        except Exception as e:
+            logger.warning("Skill selection for external CLI failed (non-fatal): %s", e)
+
+    enriched_task = task
+    if skill_context:
+        enriched_task = (
+            "You are the primary execution agent.\n"
+            "Follow the selected skill guidance below when relevant.\n\n"
+            f"{skill_context}\n\n"
+            "Original task:\n"
+            f"{task}"
+        )
+
+    return {
+        "task_for_cli": enriched_task,
+        "selected_skill_ids": selected_skill_ids,
+        "selected_skills": skill_selection,
+        "skill_context_injected": bool(skill_context),
+    }
 
 
 async def _get_openspace():
@@ -526,7 +726,7 @@ def _json_error(error: Any, **extra) -> str:
     return json.dumps({"error": str(error), **extra}, ensure_ascii=False)
 
 
-# MCP Tools (4 tools)
+# MCP Tools
 @mcp.tool()
 async def execute_task(
     task: str,
@@ -564,6 +764,41 @@ async def execute_task(
                       "local" — local SkillRegistry only (fast, no cloud).
     """
     try:
+        # External agent mode: use external CLI as primary executor while
+        # still running OpenSpace orchestration stages (skill discovery/import/
+        # selection context) so behavior remains aligned with full pipeline.
+        if os.environ.get("OPENSPACE_PRIMARY_AGENT_MODE", "").strip().lower() == "external_cli":
+            openspace = await _get_openspace()
+
+            host_skill_dirs_raw = os.environ.get("OPENSPACE_HOST_SKILL_DIRS", "")
+            if host_skill_dirs_raw:
+                env_dirs = [d.strip() for d in host_skill_dirs_raw.split(",") if d.strip()]
+                if env_dirs:
+                    await _auto_register_skill_dirs(env_dirs)
+
+            if skill_dirs:
+                await _auto_register_skill_dirs(skill_dirs)
+
+            imported_skills: List[Dict[str, Any]] = []
+            if search_scope == "all":
+                imported_skills = await _cloud_search_and_import(task)
+
+            orchestration = await _build_cli_orchestration_task(openspace, task)
+            external_result = await _run_agent_cli(
+                task=orchestration["task_for_cli"],
+                workspace_dir=workspace_dir,
+                agent_cli=os.environ.get("OPENSPACE_PRIMARY_AGENT_CLI", "codex").strip().lower() or "codex",
+                cli_command=os.environ.get("OPENSPACE_AGENT_CLI_COMMAND"),
+                timeout_seconds=int(os.environ.get("OPENSPACE_AGENT_CLI_TIMEOUT", "600")),
+            )
+            formatted_external = _format_task_result(external_result)
+            if imported_skills:
+                formatted_external["imported_skills"] = imported_skills
+            if orchestration["selected_skills"]:
+                formatted_external["selected_skills"] = orchestration["selected_skills"]
+            formatted_external["skill_context_injected"] = orchestration["skill_context_injected"]
+            return _json_ok(formatted_external)
+
         openspace = await _get_openspace()
 
         # Re-scan host skill directories (from env) to pick up skills
@@ -604,6 +839,46 @@ async def execute_task(
     except Exception as e:
         logger.error(f"execute_task failed: {e}", exc_info=True)
         return _json_error(e, status="error")
+
+
+if _ORCHESTRATOR_ROLE:
+    @mcp.tool()
+    async def execute_with_agent_cli(
+        task: str,
+        agent_cli: str = "codex",
+        workspace_dir: str | None = None,
+        cli_command: str | None = None,
+        timeout_seconds: int = 600,
+        extra_args: list[str] | None = None,
+    ) -> str:
+        """Execute a task with an existing agent CLI as the primary agent.
+
+        This is an orchestrator-only tool and is intentionally not registered
+        in public MCP mode. Start the server with ``OPENSPACE_MCP_ROLE=orchestrator``
+        to expose it.
+        """
+        try:
+            openspace = await _get_openspace()
+            orchestration = await _build_cli_orchestration_task(openspace, task)
+            result = await _run_agent_cli(
+                task=orchestration["task_for_cli"],
+                workspace_dir=workspace_dir,
+                agent_cli=agent_cli.strip().lower(),
+                cli_command=cli_command,
+                timeout_seconds=timeout_seconds,
+                extra_args=extra_args,
+            )
+            formatted = _format_task_result(result)
+            if orchestration["selected_skills"]:
+                formatted["selected_skills"] = orchestration["selected_skills"]
+            formatted["skill_context_injected"] = orchestration["skill_context_injected"]
+            return _json_ok(formatted)
+        except subprocess.SubprocessError as e:
+            logger.error("execute_with_agent_cli subprocess failure: %s", e, exc_info=True)
+            return _json_error(e, status="error")
+        except Exception as e:
+            logger.error("execute_with_agent_cli failed: %s", e, exc_info=True)
+            return _json_error(e, status="error")
 
 
 @mcp.tool()
