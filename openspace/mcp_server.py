@@ -2,6 +2,8 @@
 
 Exposes the following tools to MCP clients:
   execute_task   — Delegate a task (auto-registers skills, auto-searches, auto-evolves)
+  cli_begin_execution / cli_report_step / cli_finalize_execution
+                — Explicit CLI-controlled state machine (skill→fallback→finalize)
   search_skills  — Standalone search across local & cloud skills
   fix_skill      — Manually fix a broken skill (FIX only; DERIVED/CAPTURED via execute_task)
   upload_skill   — Upload a local skill to cloud (pre-saved metadata, bot decides visibility)
@@ -22,9 +24,14 @@ import inspect
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from openspace.cli_adapters import get_cli_adapter
 
 
 class _MCPSafeStdout:
@@ -122,8 +129,342 @@ _standalone_store = None
 
 # Internal state: tracks bot skill directories already registered this session.
 _registered_skill_dirs: set = set()
+_cli_exec_states: Dict[str, "CLIExecutionState"] = {}
 
 _UPLOAD_META_FILENAME = ".upload_meta.json"
+
+
+async def _run_agent_cli(
+    *,
+    task: str,
+    workspace_dir: Optional[str] = None,
+    agent_cli: str = "codex",
+    cli_command: Optional[str] = None,
+    timeout_seconds: int = 600,
+    extra_args: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Run an external agent CLI as the primary executor."""
+    adapter = get_cli_adapter(agent_cli)
+    command = adapter.resolve_command(explicit_command=cli_command)
+    if extra_args:
+        command.extend(extra_args)
+
+    # Most agent CLIs accept a trailing instruction argument.
+    # Keep contract simple: OpenSpace passes task as the last arg.
+    command.append(task)
+
+    cwd = workspace_dir or os.environ.get("OPENSPACE_WORKSPACE") or str(Path.cwd())
+    env = os.environ.copy()
+    env["OPENSPACE_EXECUTION_MODE"] = "external_agent_cli"
+    env["OPENSPACE_PRIMARY_AGENT_CLI"] = agent_cli
+
+    logger.info("Running external agent CLI: %s (cwd=%s)", command, cwd)
+    started = asyncio.get_event_loop().time()
+
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": cwd,
+        "env": env,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if os.name == "nt":
+        # Isolate child in a new process group so timeout cleanup can
+        # terminate the entire tree, not only the direct child process.
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        # Same intent on POSIX.
+        popen_kwargs["start_new_session"] = True
+
+    proc = await asyncio.create_subprocess_exec(*command, **popen_kwargs)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        if os.name == "nt":
+            try:
+                # Graceful interrupt first for CLIs that can shutdown cleanly.
+                proc.send_signal(subprocess.CTRL_BREAK_EVENT)
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            if proc.returncode is None:
+                proc.kill()
+        else:
+            try:
+                import signal
+                os.killpg(proc.pid, signal.SIGTERM)
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            if proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+        await proc.wait()
+        return {
+            "status": "error",
+            "response": "",
+            "error": (
+                f"External agent CLI timed out after {timeout_seconds}s and was terminated"
+            ),
+            "execution_time": round(asyncio.get_event_loop().time() - started, 2),
+            "agent_cli": agent_cli,
+            "command": command,
+            "exit_code": None,
+            "stderr": "",
+            "stdout": "",
+            "tool_executions": [],
+            "iterations": 0,
+        }
+
+    execution_time = round(asyncio.get_event_loop().time() - started, 2)
+    out_text = stdout.decode("utf-8", errors="replace")
+    err_text = stderr.decode("utf-8", errors="replace")
+    status = "success" if proc.returncode == 0 else "error"
+    response = out_text.strip() or err_text.strip()
+
+    return {
+        "status": status,
+        "response": response,
+        "error": "" if status == "success" else (err_text.strip() or f"exit code {proc.returncode}"),
+        "execution_time": execution_time,
+        "agent_cli": agent_cli,
+        "command": command,
+        "exit_code": proc.returncode,
+        "stderr": err_text[-4000:],
+        "stdout": out_text[-12000:],
+        "tool_executions": [],
+        "iterations": 1,
+    }
+
+
+async def _build_cli_orchestration_task(
+    openspace: Any,
+    task: str,
+    agent_cli: str,
+) -> Dict[str, Any]:
+    """Build full orchestration context for external CLI execution.
+
+    This mirrors OpenSpace's skill-selection stage so external CLI mode
+    can reuse the same skill engine outputs (selection + injected guidance).
+    """
+    selected_skill_ids: List[str] = []
+    skill_context = ""
+    skill_selection: List[Dict[str, Any]] = []
+
+    registry = getattr(openspace, "_skill_registry", None)
+    if registry:
+        try:
+            # External-CLI mode should avoid internal LLM selectors.
+            # Use lightweight lexical overlap ranking instead.
+            all_skills = list(registry.list_skills())
+            task_tokens = {t.lower() for t in re.findall(r"[a-zA-Z0-9_]+", task)}
+            ranked: List[tuple[int, Any]] = []
+            for s in all_skills:
+                text = f"{s.name} {s.description}".lower()
+                score = sum(1 for tok in task_tokens if tok and tok in text)
+                ranked.append((score, s))
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            selected = [s for score, s in ranked if score > 0][:2] or [s for _, s in ranked[:2]]
+            if selected:
+                selected_skill_ids = [s.skill_id for s in selected]
+                skill_context = registry.build_context_injection(selected)
+                for s in selected:
+                    skill_selection.append(
+                        {
+                            "skill_id": s.skill_id,
+                            "name": s.name,
+                            "description": s.description,
+                            "path": str(s.skill_path),
+                        }
+                    )
+        except Exception as e:
+            logger.warning("Skill selection for external CLI failed (non-fatal): %s", e)
+
+    adapter = get_cli_adapter(agent_cli)
+    enriched_task = adapter.build_task_prompt(task=task, skill_context=skill_context)
+
+    return {
+        "task_for_cli": enriched_task,
+        "selected_skill_ids": selected_skill_ids,
+        "selected_skills": skill_selection,
+        "skill_context_injected": bool(skill_context),
+    }
+
+
+async def _postprocess_external_cli_execution(
+    *,
+    openspace: Any,
+    agent_cli: str,
+    workspace_dir: Optional[str],
+    task: str,
+    execution_result: Dict[str, Any],
+    selected_skill_ids: List[str],
+) -> Dict[str, Any]:
+    """Run recording + analysis/evolution hooks for external CLI executions."""
+    task_id = f"task_{uuid.uuid4().hex[:12]}"
+    recording_dir: Optional[str] = None
+    rec_mgr = getattr(openspace, "_recording_manager", None)
+
+    try:
+        if rec_mgr:
+            if rec_mgr.recording_status:
+                await rec_mgr.stop()
+            rec_mgr.task_id = task_id
+            await rec_mgr.start()
+            await rec_mgr.add_metadata("instruction", task)
+            await rec_mgr.add_metadata("external_primary_agent", True)
+            if selected_skill_ids:
+                await rec_mgr.add_metadata("selected_skills", selected_skill_ids)
+    except Exception as e:
+        logger.debug("External CLI recording start skipped: %s", e)
+
+    # Attach execution shape expected by analyzer/evolver path
+    execution_result["task_id"] = task_id
+    execution_result["active_skills"] = selected_skill_ids
+    execution_result.setdefault("tool_executions", [])
+    execution_result.setdefault("iterations", 1)
+
+    # Parse structured execution report from CLI output so analysis/evolution
+    # can inspect concrete step-level evidence similar to GroundingAgent traces.
+    raw_output = execution_result.get("stdout") or execution_result.get("response", "")
+    adapter = get_cli_adapter(agent_cli)
+    parsed = adapter.parse_execution_output(raw_output, workspace_dir=workspace_dir)
+    report = parsed.execution_report
+    if report:
+        execution_result["execution_report"] = report
+    if parsed.tool_executions:
+        execution_result["tool_executions"] = parsed.tool_executions
+
+    try:
+        if rec_mgr and rec_mgr.recording_status:
+            recording_dir = rec_mgr.trajectory_dir
+            await rec_mgr.save_execution_outcome(
+                status=execution_result.get("status", "unknown"),
+                iterations=execution_result.get("iterations", 1),
+                execution_time=execution_result.get("execution_time", 0.0),
+            )
+            if report:
+                await rec_mgr.add_metadata("execution_report", report)
+            await rec_mgr.stop()
+    except Exception as e:
+        logger.debug("External CLI recording stop skipped: %s", e)
+
+    try:
+        cli_eval = await _run_external_cli_eval_and_evolve(
+            agent_cli=agent_cli,
+            workspace_dir=workspace_dir,
+            task=task,
+            execution_result=execution_result,
+        )
+        execution_result["cli_analysis"] = cli_eval.get("analysis", {}) if cli_eval else {}
+        execution_result["evolved_skills"] = cli_eval.get("evolved_skills", []) if cli_eval else []
+    except Exception as e:
+        logger.debug("External CLI post-analysis skipped: %s", e)
+        execution_result.setdefault("evolved_skills", [])
+
+    return execution_result
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    candidates = re.findall(r"```json\s*(\{[\s\S]*?\})\s*```", text)
+    if not candidates:
+        candidates = re.findall(r"(\{[\s\S]*\})", text)
+    for c in candidates:
+        try:
+            parsed = json.loads(c)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+async def _run_external_cli_eval_and_evolve(
+    *,
+    agent_cli: str,
+    workspace_dir: Optional[str],
+    task: str,
+    execution_result: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Use external CLI (separate context) for analysis and optional evolution."""
+    analysis_prompt = (
+        "You are an execution analyzer. Analyze task result and suggest skill evolution.\n"
+        "Return JSON only with keys: task_completed (bool), candidate_for_evolution (bool), "
+        "summary (str), evolution_suggestions (list of {type,target_skill_ids,reason}).\n\n"
+        f"Task:\n{task}\n\n"
+        f"Execution result:\n{json.dumps(execution_result, ensure_ascii=False)[:12000]}"
+    )
+    analysis_run = await _run_agent_cli(
+        task=analysis_prompt,
+        workspace_dir=workspace_dir,
+        agent_cli=agent_cli,
+        cli_command=os.environ.get("OPENSPACE_AGENT_CLI_ANALYZER_COMMAND"),
+        timeout_seconds=int(os.environ.get("OPENSPACE_AGENT_CLI_ANALYZER_TIMEOUT", "300")),
+    )
+    analysis_raw = analysis_run.get("stdout") or analysis_run.get("response", "")
+    analysis_json = _extract_json_object(analysis_raw) or {}
+
+    evolved_skills: List[Dict[str, Any]] = []
+    if analysis_json.get("candidate_for_evolution"):
+        evolve_prompt = (
+            "You are a skill evolver. Based on analysis JSON below, evolve skills in workspace if needed.\n"
+            "Return JSON only with key evolved_skills: list of "
+            "{name,path,origin,change_summary}.\n\n"
+            f"Analysis:\n{json.dumps(analysis_json, ensure_ascii=False)}"
+        )
+        evolve_run = await _run_agent_cli(
+            task=evolve_prompt,
+            workspace_dir=workspace_dir,
+            agent_cli=agent_cli,
+            cli_command=os.environ.get("OPENSPACE_AGENT_CLI_EVOLVER_COMMAND"),
+            timeout_seconds=int(os.environ.get("OPENSPACE_AGENT_CLI_EVOLVER_TIMEOUT", "300")),
+        )
+        evolve_raw = evolve_run.get("stdout") or evolve_run.get("response", "")
+        evolve_json = _extract_json_object(evolve_raw) or {}
+        if isinstance(evolve_json.get("evolved_skills"), list):
+            for es in evolve_json["evolved_skills"]:
+                if isinstance(es, dict):
+                    evolved_skills.append(es)
+
+    return {"analysis": analysis_json, "evolved_skills": evolved_skills}
+
+
+def _next_action_for_state(state: CLIExecutionState) -> Dict[str, Any]:
+    """Compute explicit next action for CLI state machine."""
+    if state.phase == "done":
+        return {"action": "stop", "reason": "execution_already_finalized"}
+    if state.phase == "skill":
+        if state.failed_steps > 0:
+            return {
+                "action": "switch_to_fallback",
+                "reason": "skill_phase_failed",
+                "cleanup_required": True,
+            }
+        return {"action": "continue_skill_phase"}
+    return {"action": "continue_fallback_phase"}
+
+
+def _cleanup_workspace_artifacts(state: CLIExecutionState) -> int:
+    if not state.workspace_dir:
+        return 0
+    removed = 0
+    for rel in list(state.created_artifacts):
+        try:
+            p = Path(state.workspace_dir) / rel
+            if not p.exists():
+                continue
+            if p.is_dir():
+                import shutil
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+            removed += 1
+        except Exception:
+            continue
+    return removed
 
 
 async def _get_openspace():
@@ -526,7 +867,7 @@ def _json_error(error: Any, **extra) -> str:
     return json.dumps({"error": str(error), **extra}, ensure_ascii=False)
 
 
-# MCP Tools (4 tools)
+# MCP Tools
 @mcp.tool()
 async def execute_task(
     task: str,
@@ -564,6 +905,50 @@ async def execute_task(
                       "local" — local SkillRegistry only (fast, no cloud).
     """
     try:
+        # External agent mode: use external CLI as primary executor while
+        # still running OpenSpace orchestration stages (skill discovery/import/
+        # selection context) so behavior remains aligned with full pipeline.
+        if os.environ.get("OPENSPACE_PRIMARY_AGENT_MODE", "").strip().lower() == "external_cli":
+            openspace = await _get_openspace()
+
+            host_skill_dirs_raw = os.environ.get("OPENSPACE_HOST_SKILL_DIRS", "")
+            if host_skill_dirs_raw:
+                env_dirs = [d.strip() for d in host_skill_dirs_raw.split(",") if d.strip()]
+                if env_dirs:
+                    await _auto_register_skill_dirs(env_dirs)
+
+            if skill_dirs:
+                await _auto_register_skill_dirs(skill_dirs)
+
+            imported_skills: List[Dict[str, Any]] = []
+            if search_scope == "all":
+                imported_skills = await _cloud_search_and_import(task)
+
+            selected_cli = os.environ.get("OPENSPACE_PRIMARY_AGENT_CLI", "codex").strip().lower() or "codex"
+            orchestration = await _build_cli_orchestration_task(openspace, task, selected_cli)
+            external_result = await _run_agent_cli(
+                task=orchestration["task_for_cli"],
+                workspace_dir=workspace_dir,
+                agent_cli=selected_cli,
+                cli_command=os.environ.get("OPENSPACE_AGENT_CLI_COMMAND"),
+                timeout_seconds=int(os.environ.get("OPENSPACE_AGENT_CLI_TIMEOUT", "600")),
+            )
+            external_result = await _postprocess_external_cli_execution(
+                openspace=openspace,
+                agent_cli=selected_cli,
+                workspace_dir=workspace_dir,
+                task=task,
+                execution_result=external_result,
+                selected_skill_ids=orchestration["selected_skill_ids"],
+            )
+            formatted_external = _format_task_result(external_result)
+            if imported_skills:
+                formatted_external["imported_skills"] = imported_skills
+            if orchestration["selected_skills"]:
+                formatted_external["selected_skills"] = orchestration["selected_skills"]
+            formatted_external["skill_context_injected"] = orchestration["skill_context_injected"]
+            return _json_ok(formatted_external)
+
         openspace = await _get_openspace()
 
         # Re-scan host skill directories (from env) to pick up skills
@@ -604,6 +989,153 @@ async def execute_task(
     except Exception as e:
         logger.error(f"execute_task failed: {e}", exc_info=True)
         return _json_error(e, status="error")
+
+
+@mcp.tool()
+async def cli_begin_execution(
+    task: str,
+    workspace_dir: str | None = None,
+    skill_dirs: list[str] | None = None,
+    search_scope: str = "all",
+    agent_cli: str = "codex",
+) -> str:
+    """Begin explicit CLI-controlled execution state machine.
+
+    The caller CLI should:
+      1) call this tool once
+      2) call ``cli_report_step`` after every action/tool
+      3) if instructed, switch to fallback phase
+      4) call ``cli_finalize_execution`` at the end
+    """
+    try:
+        openspace = await _get_openspace()
+
+        if skill_dirs:
+            await _auto_register_skill_dirs(skill_dirs)
+
+        imported_skills: List[Dict[str, Any]] = []
+        if search_scope == "all":
+            imported_skills = await _cloud_search_and_import(task)
+
+        orchestration = await _build_cli_orchestration_task(openspace, task, agent_cli)
+        execution_id = f"cli_exec_{uuid.uuid4().hex[:12]}"
+        phase = "skill" if orchestration["selected_skill_ids"] else "fallback"
+        state = CLIExecutionState(
+            execution_id=execution_id,
+            task=task,
+            workspace_dir=workspace_dir,
+            selected_skill_ids=orchestration["selected_skill_ids"],
+            selected_skills=orchestration["selected_skills"],
+            phase=phase,
+        )
+        _cli_exec_states[execution_id] = state
+        return _json_ok(
+            {
+                "execution_id": execution_id,
+                "phase": phase,
+                "task_prompt": orchestration["task_for_cli"],
+                "selected_skills": orchestration["selected_skills"],
+                "imported_skills": imported_skills,
+                "policy": {
+                    "fallback_on_first_error": True,
+                    "cleanup_on_fallback": True,
+                    "report_every_step": True,
+                },
+            }
+        )
+    except Exception as e:
+        logger.error("cli_begin_execution failed: %s", e, exc_info=True)
+        return _json_error(e, status="error")
+
+
+@mcp.tool()
+async def cli_report_step(
+    execution_id: str,
+    action: str,
+    status: str = "success",
+    detail: str = "",
+    artifacts: list[str] | None = None,
+) -> str:
+    """Report one execution step and receive next-action guidance."""
+    state = _cli_exec_states.get(execution_id)
+    if not state:
+        return _json_error("execution_id not found", status="error")
+
+    state.step_count += 1
+    if status.lower() == "error":
+        state.failed_steps += 1
+    if artifacts:
+        state.created_artifacts.extend(artifacts)
+    state.step_log.append(
+        {
+            "step": state.step_count,
+            "phase": state.phase,
+            "action": action,
+            "status": status,
+            "detail": detail,
+            "artifacts": artifacts or [],
+        }
+    )
+
+    action_info = _next_action_for_state(state)
+    if action_info.get("action") == "switch_to_fallback":
+        removed = _cleanup_workspace_artifacts(state)
+        state.phase = "fallback"
+        action_info["cleanup_removed"] = removed
+        action_info["phase"] = "fallback"
+    else:
+        action_info["phase"] = state.phase
+
+    return _json_ok(action_info)
+
+
+@mcp.tool()
+async def cli_finalize_execution(
+    execution_id: str,
+    response: str,
+    status: str = "success",
+    agent_cli: str = "codex",
+) -> str:
+    """Finalize CLI-controlled execution and trigger post-analysis/evolution."""
+    state = _cli_exec_states.get(execution_id)
+    if not state:
+        return _json_error("execution_id not found", status="error")
+
+    try:
+        openspace = await _get_openspace()
+        result = {
+            "status": status,
+            "response": response,
+            "execution_time": 0.0,
+            "tool_executions": [
+                {
+                    "tool_name": s.get("action", "external_action"),
+                    "status": s.get("status", "success"),
+                    "detail": s.get("detail", ""),
+                    "error": "" if s.get("status", "success") != "error" else s.get("detail", ""),
+                }
+                for s in state.step_log
+            ],
+            "iterations": max(1, state.step_count),
+            "stdout": response,
+            "stderr": "",
+        }
+        result = await _postprocess_external_cli_execution(
+            openspace=openspace,
+            agent_cli=agent_cli,
+            workspace_dir=state.workspace_dir,
+            task=state.task,
+            execution_result=result,
+            selected_skill_ids=state.selected_skill_ids,
+        )
+        state.phase = "done"
+        state.final_result = result
+        return _json_ok(_format_task_result(result))
+    except Exception as e:
+        logger.error("cli_finalize_execution failed: %s", e, exc_info=True)
+        return _json_error(e, status="error")
+    finally:
+        _cli_exec_states.pop(execution_id, None)
 
 
 @mcp.tool()
@@ -977,3 +1509,16 @@ def run_mcp_server() -> None:
 
 if __name__ == "__main__":
     run_mcp_server()
+@dataclass
+class CLIExecutionState:
+    execution_id: str
+    task: str
+    workspace_dir: Optional[str]
+    selected_skill_ids: List[str] = field(default_factory=list)
+    selected_skills: List[Dict[str, Any]] = field(default_factory=list)
+    phase: str = "skill"  # skill -> fallback -> done
+    step_count: int = 0
+    failed_steps: int = 0
+    created_artifacts: List[str] = field(default_factory=list)
+    step_log: List[Dict[str, Any]] = field(default_factory=list)
+    final_result: Optional[Dict[str, Any]] = None
