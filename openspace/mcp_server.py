@@ -6,9 +6,6 @@ Exposes the following tools to MCP clients:
   fix_skill      — Manually fix a broken skill (FIX only; DERIVED/CAPTURED via execute_task)
   upload_skill   — Upload a local skill to cloud (pre-saved metadata, bot decides visibility)
 
-Orchestrator-only tools (hidden unless OPENSPACE_MCP_ROLE=orchestrator):
-  execute_with_agent_cli — Run task via external agent CLI (codex/copilot/custom command)
-
 Usage:
     python -m openspace.mcp_server                     # auto (TTY -> SSE, MCP host -> stdio)
     python -m openspace.mcp_server --transport sse     # SSE on port 8080
@@ -130,9 +127,6 @@ _registered_skill_dirs: set = set()
 
 _UPLOAD_META_FILENAME = ".upload_meta.json"
 _SUPPORTED_AGENT_CLIS = {"codex", "copilot"}
-_MCP_ROLE = os.environ.get("OPENSPACE_MCP_ROLE", "public").strip().lower() or "public"
-_ORCHESTRATOR_ROLE = _MCP_ROLE == "orchestrator"
-logger.info("OpenSpace MCP role: %s", _MCP_ROLE)
 
 
 def _resolve_agent_cli_command(agent_cli: str, cli_command: Optional[str] = None) -> List[str]:
@@ -839,46 +833,6 @@ async def execute_task(
     except Exception as e:
         logger.error(f"execute_task failed: {e}", exc_info=True)
         return _json_error(e, status="error")
-
-
-if _ORCHESTRATOR_ROLE:
-    @mcp.tool()
-    async def execute_with_agent_cli(
-        task: str,
-        agent_cli: str = "codex",
-        workspace_dir: str | None = None,
-        cli_command: str | None = None,
-        timeout_seconds: int = 600,
-        extra_args: list[str] | None = None,
-    ) -> str:
-        """Execute a task with an existing agent CLI as the primary agent.
-
-        This is an orchestrator-only tool and is intentionally not registered
-        in public MCP mode. Start the server with ``OPENSPACE_MCP_ROLE=orchestrator``
-        to expose it.
-        """
-        try:
-            openspace = await _get_openspace()
-            orchestration = await _build_cli_orchestration_task(openspace, task)
-            result = await _run_agent_cli(
-                task=orchestration["task_for_cli"],
-                workspace_dir=workspace_dir,
-                agent_cli=agent_cli.strip().lower(),
-                cli_command=cli_command,
-                timeout_seconds=timeout_seconds,
-                extra_args=extra_args,
-            )
-            formatted = _format_task_result(result)
-            if orchestration["selected_skills"]:
-                formatted["selected_skills"] = orchestration["selected_skills"]
-            formatted["skill_context_injected"] = orchestration["skill_context_injected"]
-            return _json_ok(formatted)
-        except subprocess.SubprocessError as e:
-            logger.error("execute_with_agent_cli subprocess failure: %s", e, exc_info=True)
-            return _json_error(e, status="error")
-        except Exception as e:
-            logger.error("execute_with_agent_cli failed: %s", e, exc_info=True)
-            return _json_error(e, status="error")
 
 
 @mcp.tool()
