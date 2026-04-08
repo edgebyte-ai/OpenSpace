@@ -25,6 +25,7 @@ import os
 import shlex
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -318,6 +319,65 @@ async def _build_cli_orchestration_task(
         "selected_skills": skill_selection,
         "skill_context_injected": bool(skill_context),
     }
+
+
+async def _postprocess_external_cli_execution(
+    *,
+    openspace: Any,
+    task: str,
+    execution_result: Dict[str, Any],
+    selected_skill_ids: List[str],
+) -> Dict[str, Any]:
+    """Run recording + analysis/evolution hooks for external CLI executions."""
+    task_id = f"task_{uuid.uuid4().hex[:12]}"
+    recording_dir: Optional[str] = None
+    rec_mgr = getattr(openspace, "_recording_manager", None)
+
+    try:
+        if rec_mgr:
+            if rec_mgr.recording_status:
+                await rec_mgr.stop()
+            rec_mgr.task_id = task_id
+            await rec_mgr.start()
+            await rec_mgr.add_metadata("instruction", task)
+            await rec_mgr.add_metadata("external_primary_agent", True)
+            if selected_skill_ids:
+                await rec_mgr.add_metadata("selected_skills", selected_skill_ids)
+    except Exception as e:
+        logger.debug("External CLI recording start skipped: %s", e)
+
+    # Attach execution shape expected by analyzer/evolver path
+    execution_result["task_id"] = task_id
+    execution_result["active_skills"] = selected_skill_ids
+    execution_result.setdefault("tool_executions", [])
+    execution_result.setdefault("iterations", 1)
+
+    try:
+        if rec_mgr and rec_mgr.recording_status:
+            recording_dir = rec_mgr.trajectory_dir
+            await rec_mgr.save_execution_outcome(
+                status=execution_result.get("status", "unknown"),
+                iterations=execution_result.get("iterations", 1),
+                execution_time=execution_result.get("execution_time", 0.0),
+            )
+            await rec_mgr.stop()
+    except Exception as e:
+        logger.debug("External CLI recording stop skipped: %s", e)
+
+    try:
+        openspace._last_evolved_skills = []
+        await openspace._maybe_analyze_execution(
+            task_id=task_id,
+            recording_dir=recording_dir,
+            execution_result=execution_result,
+        )
+        await openspace._maybe_evolve_quality()
+        execution_result["evolved_skills"] = list(getattr(openspace, "_last_evolved_skills", []))
+    except Exception as e:
+        logger.debug("External CLI post-analysis skipped: %s", e)
+        execution_result.setdefault("evolved_skills", [])
+
+    return execution_result
 
 
 async def _get_openspace():
@@ -784,6 +844,12 @@ async def execute_task(
                 agent_cli=os.environ.get("OPENSPACE_PRIMARY_AGENT_CLI", "codex").strip().lower() or "codex",
                 cli_command=os.environ.get("OPENSPACE_AGENT_CLI_COMMAND"),
                 timeout_seconds=int(os.environ.get("OPENSPACE_AGENT_CLI_TIMEOUT", "600")),
+            )
+            external_result = await _postprocess_external_cli_execution(
+                openspace=openspace,
+                task=task,
+                execution_result=external_result,
+                selected_skill_ids=orchestration["selected_skill_ids"],
             )
             formatted_external = _format_task_result(external_result)
             if imported_skills:
